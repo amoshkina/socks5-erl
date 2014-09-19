@@ -93,7 +93,7 @@ handle_cast({reply, Data}, State = #state{client_sock = ClientSock, transport = 
 
 handle_cast(close_connection, State = #state{client_sock = ClientSock, transport = Transport}) ->
   Transport:close(ClientSock),
-  lager:warning("Close connection"),
+%%   lager:warning("Close connection"),
   {noreply, State};
 
 handle_cast(stop, State) ->
@@ -105,19 +105,19 @@ handle_cast({parse_request, <<?SOCKS_VER, _NumMeth, Methods/binary>>}, State = #
   {noreply, State#state{status = socks_req, auth_method = AuthMethod}};
 handle_cast({parse_request, <<?SOCKS_VER, Cmd, 0, Atyp, Address/binary>>},
     State = #state{client_sock = ClientSock, status = socks_req}) ->
-  {ok, Host, Port} = parse_addr(Atyp, Address),
-  case eval_request(Cmd, Host, Port) of
+  Result = parse_addr(Atyp, Address),
+  case eval_request(Cmd, Result) of
     {ok, DestSock} ->
+      {ok, Host, Port} = Result,
       lager:info("Client ~s connected to host ~s on port ~w", [get_address(socket, ClientSock),
         get_address(ipv4, Host), Port]),
       reply(self(), <<?SOCKS_VER, ?SUCCESS, 0, Atyp, Address/binary>>),
-%%       lager:warning("Reply = ~w", [<<?SOCKS_VER, ?SUCCESS, 0, Atyp, Address/binary>>]),
-      {noreply, State#state{status = proxy, dest_sock = DestSock}}
+      {noreply, State#state{status = proxy, dest_sock = DestSock}};
 
-%%     {error, Errno} ->
-%%       Rep = errno_to_rep(Errno),
-%%       reply(self, <<?SOCKS_VER, Rep, 0, Atyp, Address/binary>>),
-%%       close_connection(self())
+    {error, Rep} ->
+      reply(self, <<?SOCKS_VER, Rep, 0, Atyp, Address/binary>>),
+      close_connection(self()),
+      {noreply, State}
   end;
 handle_cast({parse_request, Data}, State = #state{status = proxy, dest_sock = DestSock}) ->
   ok = gen_tcp:send(DestSock, Data),
@@ -126,16 +126,27 @@ handle_cast({parse_request, Data}, State = #state{status = proxy, dest_sock = De
 %%===================================================================================
 %% TODO: move this block to internal functions
 
-eval_request(1, Host, Port) -> % TODO 2, 3
-  gen_tcp:connect(Host,Port, []).
+eval_request(1, {ok, Host, Port}) -> % TODO 2, 3
+  gen_tcp:connect(Host,Port, []);
+eval_request(_Cmd, {error, Reason}) ->
+  errno_to_rep(Reason);
 
-%% eval_request(_Cmd, _Host, _Port) ->
-%%   {error, 7}. % command not supported
-%%
-%%
-%% errno_to_rep(Errno) -> % TODO
-%%   Errno.
+eval_request(_Cmd, {ok, _Host, _Port}) ->
+  {error, 7}. % command not supported
 
+
+% TODO: 02 connection not allowed by ruleset
+% TODO: 06 TTL expired
+errno_to_rep(enetunreach) ->
+  {error, 3}; % network unreachable
+errno_to_rep(ehostunreach) ->
+  {error, 4}; % host unreachable
+errno_to_rep(econnrefused) ->
+  {error, 5}; % connection refused
+errno_to_rep(eatypnotsupp) ->
+  {error, 8}; % address type not supported
+errno_to_rep(_Reason) ->
+  {error, 1}. % general SOCKS server failure
 
 %%===================================================================================
 
@@ -187,10 +198,15 @@ parse_addr(1, <<HostBin:4/binary, PortBin:2/binary>>) -> % IPv4
 parse_addr(3, <<Octets, DomainPort/binary>>) -> % domain name
   <<Domain:Octets/binary, PortBin:2/binary>> = DomainPort,
   <<Port:16>> = PortBin,
-  {ok, {hostent, _, _, _, _, [Host|_Tail]}} = inet_res:gethostbyname(binary_to_list(Domain)), % TODO
-  {ok, Host, Port}.
+  case inet_res:gethostbyname(binary_to_list(Domain)) of
+    {ok, {hostent, _, _, _, _, [Host|_Tail]}} -> {ok, Host, Port};
+    {error, Reason} -> {error, Reason}
+  end;
 %% parse_addr(4, _Ad) -> % IPv6 % TODO
 %%   ok.
+parse_addr(_Atyp, _Addr) ->
+  {error, eatypnotsupp}.
+
 
 get_address(socket, Socket) ->
   {ok, {Address, _Port}} = inet:peername(Socket),
