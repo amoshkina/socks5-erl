@@ -1,0 +1,20 @@
+%%%-------------------------------------------------------------------
+%%% @author anna
+%%% @copyright (C) 2014, <COMPANY>
+%%% @doc
+%%%
+%%% @end
+%%% Created : 17. Sep 2014 13:54
+%%%-------------------------------------------------------------------
+{application, socks5, [
+  {description, "Socks5 server, Exante test task."},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [
+    kernel,
+    stdlib,
+    ranch
+  ]},
+  {mod, {socks5_app, []}},
+  {env, []}
+]}.

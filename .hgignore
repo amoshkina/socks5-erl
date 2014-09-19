@@ -1,0 +1,9 @@
+syntax: glob
+
+.idea
+.rebar
+log
+deps
+ebin
+*.dump
+*.iml
