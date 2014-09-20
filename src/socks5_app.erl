@@ -22,9 +22,10 @@
 start(_StartType, _StartArgs) ->
   % getting parameters from config
   {ok, Socks5Port} = application:get_env(socks5_port),
+  {ok, IdleTime} = application:get_env(idle_time),
 
   {ok, _} = ranch:start_listener(socks5_tcp, 1,
-    ranch_tcp, [{port, Socks5Port}], ph_socks5_server, []),
+    ranch_tcp, [{port, Socks5Port}], ph_socks5_server, [IdleTime]),
   socks5_sup:start_link().
 
 %%--------------------------------------------------------------------

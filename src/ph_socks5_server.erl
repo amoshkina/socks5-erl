@@ -15,12 +15,13 @@
 -export([
   start_link/4,
   stop/1,
-  reply/2,
+  send_to_client/2,
   close_connection/1
 ]).
 
 %% gen_server callbacks
--export([init/1,
+%% init/1 callback does not exports because of using gen_server:enter_loop/4
+-export([
   handle_call/3,
   handle_cast/2,
   handle_info/2,
@@ -34,7 +35,7 @@
 
 -include("socks5.hrl").
 
--record(state, {ref, client_sock, transport, status, auth_method, dest_sock}).
+-record(state, {ref, client_sock, transport, status, auth_method, dest_sock, udp_sock, idle_time}).
 
 %%%===================================================================
 %%% API
@@ -42,19 +43,17 @@
 
 start_link(Ref, ClientSock, Transport, Opts) ->
   {ok, Pid} = proc_lib:start_link(?MODULE, pl_init, [Ref, ClientSock, Transport, Opts]),
-  lager:info("Client ~s connected to socks5 server", [get_address(socket, ClientSock)]),
+  {ok, {ClientHost, _ClientPort}} = inet:peername(ClientSock),
+  lager:info("Client ~s connected to socks5 server", [ipv4_to_string(ClientHost)]),
   {ok, Pid}.
 
-pl_init(Ref, ClientSock, Transport, _Opts = []) ->
+pl_init(Ref, ClientSock, Transport, _Opts = [IdleTime]) ->
   ok = proc_lib:init_ack({ok, self()}),
-  %% Sets Socket in active once mode to receive data from socket asynchronously only once (which not allows to flood
-  %% the process' mailbox)
   ok = Transport:setopts(ClientSock, [{active, once}]),
-  %% Triggers self() process to be the Socket's owner
+  %% Triggers self() process to be the ClientSocket's owner
   ok = ranch:accept_ack(Ref),
-  %% TODO: maybe start some gen_fsm here
   gen_server:enter_loop(?MODULE, [], #state{ref = Ref, client_sock = ClientSock, transport = Transport,
-    status = auth_method, auth_method = 0}).
+    status = auth_method, auth_method = ?NO_AUTH, idle_time = IdleTime}, IdleTime).
 
 %%--------------------------------------------------------------------
 %% Stops process
@@ -62,15 +61,14 @@ stop(Pid) ->
   gen_server:cast(Pid, stop).
 
 %%--------------------------------------------------------------------
-%% Sends a reply to device
-reply(Pid, Data) ->
-  gen_server:cast(Pid, {reply, Data}).
+%% Sends data to client
+send_to_client(Pid, Data) ->
+  gen_server:cast(Pid, {send_to_client, Data}).
 
 %%--------------------------------------------------------------------
-%% Closes connection with device
+%% Closes connection with client
 close_connection(Pid) ->
-  gen_server:cast(Pid, close_connection),
-  stop(Pid).
+  gen_server:cast(Pid, close_connection).
 %%--------------------------------------------------------------------
 parse_request(Pid, RawReq) ->
   gen_server:cast(Pid, {parse_request, RawReq}).
@@ -79,95 +77,103 @@ parse_request(Pid, RawReq) ->
 %%% gen_server callbacks
 %%%===================================================================
 
-init([Ref, ClientSock, Transport, _Opts = []]) ->
-  {ok, #state{ref = Ref, client_sock = ClientSock, transport = Transport}}.
-%%--------------------------------------------------------------------
+%% No meaningful handle_call callbacks
 handle_call(_Request, _From, State) ->
   {reply, ok, State}.
 
 %%--------------------------------------------------------------------
 
-handle_cast({reply, Data}, State = #state{client_sock = ClientSock, transport = Transport}) ->
-  Transport:send(ClientSock, Data),
-  {noreply, State};
+handle_cast({send_to_client, Data}, State = #state{client_sock = ClientSock, transport = Transport, idle_time = IdleTime}) ->
+  ok = Transport:send(ClientSock, Data),
+  {noreply, State, IdleTime};
+
+handle_cast({parse_request, <<?SOCKS_VER, _NumMeth, Methods/binary>>}, State = #state{status = auth_method,
+    idle_time = IdleTime}) ->
+  {method, AuthMethod} = choose_auth_method(binary_to_list(Methods)),
+  send_to_client(self(), <<?SOCKS_VER, AuthMethod>>),
+  {noreply, State#state{status = socks_req, auth_method = AuthMethod}, IdleTime};
+
+handle_cast({parse_request, <<?SOCKS_VER, Cmd, ?RSV, Atyp, Address/binary>>},
+    State = #state{client_sock = ClientSock, idle_time = IdleTime}) ->
+  {ok, {ClientHost, _ClientPort}} = inet:peername(ClientSock),
+  ClientIpStr = ipv4_to_string(ClientHost),
+  Result = parse_addr(Atyp, Address),
+
+  case eval_request(Cmd, Result) of
+    {connect, {ok, DestSock}} ->
+      ok = inet:setopts(DestSock, [{active, once}]),
+      {ok, {DestHost, DestPort}} = inet:peername(DestSock),
+      DestHostBin = list_to_binary(tuple_to_list(DestHost)),
+      lager:info("Client ~s connected to host ~s on port ~w", [ClientIpStr, ipv4_to_string(DestHost), DestPort]),
+      send_to_client(self(), <<?SOCKS_VER, ?SUCCESS, ?RSV, ?IPV4, DestHostBin:4/binary, DestPort:16/integer>>),
+      {noreply, State#state{status = proxy_from_client, dest_sock = DestSock}, IdleTime};
+
+    {bind, {ok, BindSock}} ->
+      {ok, {BindHost, BindPort}} = inet:sockname(BindSock),
+      BindHostBin = list_to_binary(tuple_to_list(BindHost)),
+      lager:info("Client ~s binded socket on host ~s to port ~w", [ClientIpStr, ipv4_to_string(BindHost), BindPort]),
+      send_to_client(self(), <<?SOCKS_VER, ?SUCCESS, ?RSV, ?IPV4, BindHostBin:4/binary, BindPort:16>>),
+      {ok, _Pid} = ph_bind_server:start(self(), BindSock),
+      lager:warning("bind, status = ~w", State#state.status),
+      {noreply, State, IdleTime};
+
+    {_Any, {error, Reason}} ->
+      {error, Rep} = errno_to_rep(Reason),
+      lager:warning("Error ~w occured, closing connection to client ~s", [Rep, ClientIpStr]),
+      send_to_client(self(), <<?SOCKS_VER, Rep, ?RSV, Atyp, Address/binary>>),
+      close_connection(self()),
+      {stop, normal, State}
+  end;
+
+handle_cast({parse_request, Data}, State = #state{status = proxy_from_client, dest_sock = DestSock,
+    idle_time = IdleTime}) ->
+  ok = gen_tcp:send(DestSock, Data),
+  {noreply, State, IdleTime};
 
 handle_cast(close_connection, State = #state{client_sock = ClientSock, transport = Transport}) ->
   Transport:close(ClientSock),
-%%   lager:warning("Close connection"),
-  {noreply, State};
-
-handle_cast(stop, State) ->
   {stop, normal, State};
 
-handle_cast({parse_request, <<?SOCKS_VER, _NumMeth, Methods/binary>>}, State = #state{status = auth_method}) ->
-  {method, AuthMethod} = choose_auth_method(binary_to_list(Methods)),
-  reply(self(), <<?SOCKS_VER, AuthMethod>>),
-  {noreply, State#state{status = socks_req, auth_method = AuthMethod}};
-handle_cast({parse_request, <<?SOCKS_VER, Cmd, 0, Atyp, Address/binary>>},
-    State = #state{client_sock = ClientSock, status = socks_req}) ->
-  Result = parse_addr(Atyp, Address),
-  case eval_request(Cmd, Result) of
-    {ok, DestSock} ->
-      {ok, Host, Port} = Result,
-      lager:info("Client ~s connected to host ~s on port ~w", [get_address(socket, ClientSock),
-        get_address(ipv4, Host), Port]),
-      reply(self(), <<?SOCKS_VER, ?SUCCESS, 0, Atyp, Address/binary>>),
-      {noreply, State#state{status = proxy, dest_sock = DestSock}};
-
-    {error, Rep} ->
-      reply(self, <<?SOCKS_VER, Rep, 0, Atyp, Address/binary>>),
-      close_connection(self()),
-      {noreply, State}
-  end;
-handle_cast({parse_request, Data}, State = #state{status = proxy, dest_sock = DestSock}) ->
-  ok = gen_tcp:send(DestSock, Data),
-  {noreply, State}.
-
-%%===================================================================================
-%% TODO: move this block to internal functions
-
-eval_request(1, {ok, Host, Port}) -> % TODO 2, 3
-  gen_tcp:connect(Host,Port, []);
-eval_request(_Cmd, {error, Reason}) ->
-  errno_to_rep(Reason);
-
-eval_request(_Cmd, {ok, _Host, _Port}) ->
-  {error, 7}. % command not supported
-
-
-% TODO: 02 connection not allowed by ruleset
-% TODO: 06 TTL expired
-errno_to_rep(enetunreach) ->
-  {error, 3}; % network unreachable
-errno_to_rep(ehostunreach) ->
-  {error, 4}; % host unreachable
-errno_to_rep(econnrefused) ->
-  {error, 5}; % connection refused
-errno_to_rep(eatypnotsupp) ->
-  {error, 8}; % address type not supported
-errno_to_rep(_Reason) ->
-  {error, 1}. % general SOCKS server failure
-
-%%===================================================================================
-
-
+handle_cast(stop, State) ->
+  {stop, normal, State}.
 
 %%--------------------------------------------------------------------
 
-handle_info({tcp, ClientSock, RawReq}, State = #state{client_sock = ClientSock, transport = Transport}) ->
-%%   lager:info("RawReq = ~w", [RawReq]),
-  parse_request(self(), RawReq),
-%%   lager:info("Reply generated: ", [Reply]),
-%%   reply(self(), Reply),
+handle_info({tcp, ClientSock, RawReq}, State = #state{client_sock = ClientSock, transport = Transport,
+    idle_time = IdleTime}) ->
+  ok = parse_request(self(), RawReq),
   ok = Transport:setopts(ClientSock, [{active, once}]),
-  {noreply, State};
+  {noreply, State, IdleTime};
 
-handle_info({tcp, DestSock, Data}, State = #state{dest_sock = DestSock, client_sock = ClientSock}) ->
-  ok = gen_tcp:send(ClientSock, Data),
-  {noreply, State};
+handle_info({tcp, DestSock, Data}, State = #state{dest_sock = DestSock, idle_time = IdleTime}) ->
+  ok = send_to_client(self(), Data),
+  ok = inet:setopts(DestSock, [{active, once}]),
+  {noreply, State, IdleTime};
 
-%% Stops the process because of closing TCP connection by client (or destination host???). TODO ???
+handle_info({bind_accepted, Host, Port}, State = #state{client_sock = ClientSock, idle_time = IdleTime}) ->
+  {ok, {ClientHost, _ClientPort}} = inet:peername(ClientSock),
+  lager:info("Client ~s got server-to-client connection with host ~s on port ~w", [ipv4_to_string(ClientHost),
+    ipv4_to_string(Host), Port]),
+  HostBin = list_to_binary(tuple_to_list(Host)),
+  ok = send_to_client(self(), <<?SOCKS_VER, ?SUCCESS, ?RSV, ?IPV4, HostBin:4/binary, Port:16>>),
+  {noreply, State, IdleTime};
+
+handle_info({proxy_to_client, Data}, State = #state{idle_time = IdleTime}) ->
+  lager:warning("tcp forwarded"),
+  ok = send_to_client(self(), Data),
+  {noreply, State, IdleTime};
+
+%% Stops the process because of closing TCP connection by client (or destination host).
 handle_info({tcp_closed, _Socket}, State) ->
+  lager:warning("socks5 server stops via tcp closed"),
+  {stop, normal, State};
+
+handle_info(timeout, State = #state{dest_sock = DestSock}) ->
+  lager:warning("Dest Sock undefined? Dest Sock = ~w", [DestSock]),
+  {ok, {DestHost, DestPort}} = inet:sockname(DestSock),
+  DestHostBin = list_to_binary(tuple_to_list(DestHost)),
+  send_to_client(self(), <<?SOCKS_VER, ?TTL_EXPIRED, ?RSV, ?IPV4, DestHostBin:4/binary, DestPort:16>>),
+  close_connection(self()),
   {stop, normal, State}.
 %%--------------------------------------------------------------------
 
@@ -183,7 +189,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 choose_auth_method([]) ->
-  {method, 16#FF};
+  {method, ?NO_ACCEPTABLE_METH};
 choose_auth_method([Method|Tail]) ->
   Result = lists:member(Method, ?AUTH_METHODS),
   if
@@ -202,15 +208,32 @@ parse_addr(3, <<Octets, DomainPort/binary>>) -> % domain name
     {ok, {hostent, _, _, _, _, [Host|_Tail]}} -> {ok, Host, Port};
     {error, Reason} -> {error, Reason}
   end;
-%% parse_addr(4, _Ad) -> % IPv6 % TODO
-%%   ok.
 parse_addr(_Atyp, _Addr) ->
   {error, eatypnotsupp}.
 
-
-get_address(socket, Socket) ->
-  {ok, {Address, _Port}} = inet:peername(Socket),
-  get_address(ipv4, Address);
-get_address(ipv4, Address) ->
+ipv4_to_string(Address) ->
   io_lib:format("~w.~w.~w.~w", tuple_to_list(Address)).
+
+eval_request(?CONNECT, {ok, Host, Port}) ->
+  Res = gen_tcp:connect(Host, Port, []),
+  {connect, Res};
+eval_request(?BIND, {ok, Host, Port}) ->
+  Res = gen_tcp:listen(Port, [{ip, Host}]),
+  {bind, Res};
+eval_request(_Cmd, {ok, _Host, _Port}) ->
+  {any, {error, ?CMD_NOT_SUPPORT}};
+eval_request(_Cmd, {error, Reason}) ->
+  {any, {error, Reason}}.
+
+% TODO: 06 TTL expired
+errno_to_rep(enetunreach) ->
+  {error, ?NET_UNREACH}; % network unreachable
+errno_to_rep(ehostunreach) ->
+  {error, ?HOST_UNREACH}; % host unreachable
+errno_to_rep(econnrefused) ->
+  {error, ?CONN_REFUSED}; % connection refused
+errno_to_rep(eatypnotsupp) ->
+  {error, ?ATYP_NOT_SUPPORT}; % address type not supported
+errno_to_rep(_Reason) ->
+  {error, ?GEN_FAILURE}. % general SOCKS server failure
 

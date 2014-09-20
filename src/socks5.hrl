@@ -9,7 +9,7 @@
 -author("anna").
 
 -define(SOCKS_VER, 5).
--define(AUTH_METHODS, [0, 1, 2]).
+-define(AUTH_METHODS, [?NO_AUTH]).
 
 %% Server's replies after evaluating request
 -define(SUCCESS, 0).
@@ -21,3 +21,22 @@
 -define(TTL_EXPIRED, 6).
 -define(CMD_NOT_SUPPORT, 7).
 -define(ATYP_NOT_SUPPORT, 8).
+
+%% Commands
+-define(CONNECT, 1).
+-define(BIND, 2).
+-define(UDP_ASSOCIATE, 3).
+
+%% Address types
+-define(IPV4, 1).
+-define(DOMAINNAME, 3).
+-define(IPV6, 4).
+
+%% Reserved byte
+-define(RSV, 0).
+
+%% Authentification methods
+-define(NO_AUTH, 0).
+-define(GSSAPI, 1).
+-define(UNAME_PASSWD, 2).
+-define(NO_ACCEPTABLE_METH, 16#FF).
