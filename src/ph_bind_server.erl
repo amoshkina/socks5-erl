@@ -53,12 +53,10 @@ handle_cast(_Request, State) ->
   {noreply, State}.
 
 handle_info({tcp, CSock, Data}, State = #state{ref = Ref, c_sock = CSock}) ->
-  lager:warning("tcp received, ~w", [Data]),
   Ref ! {proxy_to_client, Data},
   {noreply, State};
 
 handle_info({'DOWN', MonitorRef, process, _Object, _Info}, State = #state{c_sock = CSock, monitor_ref = MonitorRef}) ->
-  lager:warning("Child listen stops"),
   ok = gen_tcp:close(CSock),
   {stop, normal, State};
 

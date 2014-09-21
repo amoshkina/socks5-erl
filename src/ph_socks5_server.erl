@@ -35,7 +35,7 @@
 
 -include("socks5.hrl").
 
--record(state, {ref, client_sock, transport, status, auth_method, dest_sock, udp_sock, idle_time}).
+-record(state, {ref, client_sock, transport, status, auth_method, dest_sock, udp_sock, idle_time, users_table}).
 
 %%%===================================================================
 %%% API
@@ -47,13 +47,13 @@ start_link(Ref, ClientSock, Transport, Opts) ->
   lager:info("Client ~s connected to socks5 server", [ipv4_to_string(ClientHost)]),
   {ok, Pid}.
 
-pl_init(Ref, ClientSock, Transport, _Opts = [IdleTime]) ->
+pl_init(Ref, ClientSock, Transport, _Opts = [UsersTable, IdleTime]) ->
   ok = proc_lib:init_ack({ok, self()}),
   ok = Transport:setopts(ClientSock, [{active, once}]),
   %% Triggers self() process to be the ClientSocket's owner
   ok = ranch:accept_ack(Ref),
   gen_server:enter_loop(?MODULE, [], #state{ref = Ref, client_sock = ClientSock, transport = Transport,
-    status = auth_method, auth_method = ?NO_AUTH, idle_time = IdleTime}, IdleTime).
+    status = auth_method, auth_method = ?NO_AUTH, idle_time = IdleTime, users_table = UsersTable}, IdleTime).
 
 %%--------------------------------------------------------------------
 %% Stops process
@@ -83,23 +83,24 @@ handle_call(_Request, _From, State) ->
 
 %%--------------------------------------------------------------------
 
-handle_cast({send_to_client, Data}, State = #state{client_sock = ClientSock, transport = Transport, idle_time = IdleTime}) ->
+handle_cast({send_to_client, Data}, State = #state{client_sock = ClientSock, transport = Transport,
+    idle_time = IdleTime}) ->
   ok = Transport:send(ClientSock, Data),
   {noreply, State, IdleTime};
 
 handle_cast({parse_request, <<?SOCKS_VER, _NumMeth, Methods/binary>>}, State = #state{status = auth_method,
     idle_time = IdleTime}) ->
-  {method, AuthMethod} = choose_auth_method(binary_to_list(Methods)),
+  {method, AuthMethod, Status} = choose_auth_method(binary_to_list(Methods)),
   send_to_client(self(), <<?SOCKS_VER, AuthMethod>>),
-  {noreply, State#state{status = socks_req, auth_method = AuthMethod}, IdleTime};
+  {noreply, State#state{status = Status, auth_method = AuthMethod}, IdleTime};
 
 handle_cast({parse_request, <<?SOCKS_VER, Cmd, ?RSV, Atyp, Address/binary>>},
-    State = #state{client_sock = ClientSock, idle_time = IdleTime}) ->
+    State = #state{client_sock = ClientSock, idle_time = IdleTime, status = Status}) ->
   {ok, {ClientHost, _ClientPort}} = inet:peername(ClientSock),
   ClientIpStr = ipv4_to_string(ClientHost),
   Result = parse_addr(Atyp, Address),
 
-  case eval_request(Cmd, Result) of
+  case eval_request(Cmd, Result, Status) of
     {connect, {ok, DestSock}} ->
       ok = inet:setopts(DestSock, [{active, once}]),
       {ok, {DestHost, DestPort}} = inet:peername(DestSock),
@@ -114,13 +115,25 @@ handle_cast({parse_request, <<?SOCKS_VER, Cmd, ?RSV, Atyp, Address/binary>>},
       lager:info("Client ~s binded socket on host ~s to port ~w", [ClientIpStr, ipv4_to_string(BindHost), BindPort]),
       send_to_client(self(), <<?SOCKS_VER, ?SUCCESS, ?RSV, ?IPV4, BindHostBin:4/binary, BindPort:16>>),
       {ok, _Pid} = ph_bind_server:start(self(), BindSock),
-      lager:warning("bind, status = ~w", State#state.status),
       {noreply, State, IdleTime};
 
     {_Any, {error, Reason}} ->
       {error, Rep} = errno_to_rep(Reason),
       lager:warning("Error ~w occured, closing connection to client ~s", [Rep, ClientIpStr]),
       send_to_client(self(), <<?SOCKS_VER, Rep, ?RSV, Atyp, Address/binary>>),
+      close_connection(self()),
+      {stop, normal, State}
+  end;
+
+handle_cast({parse_request, <<?UNAME_VER, ULen, UName:ULen/binary, PLen, Passwd:PLen/binary>>},
+    State = #state{status = uname_auth, idle_time = IdleTime, users_table = UsersTable}) ->
+  Res = ets:lookup(UsersTable, binary_to_list(UName)),
+  case check_passwd(Res, binary_to_list(Passwd)) of
+    ok ->
+      send_to_client(self(), <<?UNAME_VER, ?SUCCESS>>),
+      {noreply, State#state{status = socks_req}, IdleTime};
+    error ->
+      send_to_client(self(), <<?UNAME_VER, ?FAILURE>>),
       close_connection(self()),
       {stop, normal, State}
   end;
@@ -159,19 +172,18 @@ handle_info({bind_accepted, Host, Port}, State = #state{client_sock = ClientSock
   {noreply, State, IdleTime};
 
 handle_info({proxy_to_client, Data}, State = #state{idle_time = IdleTime}) ->
-  lager:warning("tcp forwarded"),
   ok = send_to_client(self(), Data),
   {noreply, State, IdleTime};
 
 %% Stops the process because of closing TCP connection by client (or destination host).
 handle_info({tcp_closed, _Socket}, State) ->
-  lager:warning("socks5 server stops via tcp closed"),
   {stop, normal, State};
 
-handle_info(timeout, State = #state{dest_sock = DestSock}) ->
-  lager:warning("Dest Sock undefined? Dest Sock = ~w", [DestSock]),
+handle_info(timeout, State = #state{client_sock = ClientSock, dest_sock = DestSock}) ->
+  {ok, {ClientHost, _ClientPort}} = inet:sockname(ClientSock),
   {ok, {DestHost, DestPort}} = inet:sockname(DestSock),
   DestHostBin = list_to_binary(tuple_to_list(DestHost)),
+  lager:warning("Error ~w occured, closing connection to client ~s", [?TTL_EXPIRED, ipv4_to_string(ClientHost)]),
   send_to_client(self(), <<?SOCKS_VER, ?TTL_EXPIRED, ?RSV, ?IPV4, DestHostBin:4/binary, DestPort:16>>),
   close_connection(self()),
   {stop, normal, State}.
@@ -190,12 +202,17 @@ code_change(_OldVsn, State, _Extra) ->
 
 choose_auth_method([]) ->
   {method, ?NO_ACCEPTABLE_METH};
+choose_auth_method([_Method1, Method2 | Tail]) ->
+  choose_auth_method(Method2, Tail);
 choose_auth_method([Method|Tail]) ->
-  Result = lists:member(Method, ?AUTH_METHODS),
-  if
-    Result -> {method, Method};
-    true -> choose_auth_method(Tail)
-  end.
+  choose_auth_method(Method, Tail).
+
+choose_auth_method(?NO_AUTH, _Methods) ->
+  {method, ?NO_AUTH, socks_req};
+choose_auth_method(?UNAME_PASSWD, _Methods) ->
+  {method, ?UNAME_PASSWD, uname_auth};
+choose_auth_method(_Method, Methods) ->
+  choose_auth_method(Methods).
 
 parse_addr(1, <<HostBin:4/binary, PortBin:2/binary>>) -> % IPv4
   Host = list_to_tuple(binary_to_list(HostBin)),
@@ -214,26 +231,43 @@ parse_addr(_Atyp, _Addr) ->
 ipv4_to_string(Address) ->
   io_lib:format("~w.~w.~w.~w", tuple_to_list(Address)).
 
-eval_request(?CONNECT, {ok, Host, Port}) ->
+eval_request(?CONNECT, {ok, Host, Port}, socks_req) ->
   Res = gen_tcp:connect(Host, Port, []),
   {connect, Res};
-eval_request(?BIND, {ok, Host, Port}) ->
+eval_request(?BIND, {ok, Host, Port}, proxy_from_client) ->
   Res = gen_tcp:listen(Port, [{ip, Host}]),
   {bind, Res};
-eval_request(_Cmd, {ok, _Host, _Port}) ->
-  {any, {error, ?CMD_NOT_SUPPORT}};
-eval_request(_Cmd, {error, Reason}) ->
+eval_request(?BIND, {ok, _Host, _Port}, _Status) ->
+  {any, {error, egenfailure}};
+eval_request(_Cmd, {ok, _Host, _Port}, _Status) ->
+  {any, {error, ecmdnotsupp}};
+eval_request(_Cmd, {error, Reason}, _Status) ->
   {any, {error, Reason}}.
 
-% TODO: 06 TTL expired
 errno_to_rep(enetunreach) ->
   {error, ?NET_UNREACH}; % network unreachable
 errno_to_rep(ehostunreach) ->
   {error, ?HOST_UNREACH}; % host unreachable
 errno_to_rep(econnrefused) ->
   {error, ?CONN_REFUSED}; % connection refused
+errno_to_rep(ecmdnotsupp) ->
+  {error, ?CMD_NOT_SUPPORT}; % command not supported
 errno_to_rep(eatypnotsupp) ->
   {error, ?ATYP_NOT_SUPPORT}; % address type not supported
 errno_to_rep(_Reason) ->
   {error, ?GEN_FAILURE}. % general SOCKS server failure
+
+
+check_passwd([{_Uname, Salt, Hash}], Passwd) ->
+  Hash1_ = crypto:hash(md5, Salt ++ Passwd),
+  Hash1 = lists:flatten([io_lib:format("~2.16.0b",[X]) || <<X:8>> <= Hash1_ ]),
+  check_passwd(Hash, Hash1);
+check_passwd(Hash, Hash) ->
+  ok;
+check_passwd([_Passwd1], _Passwd2) ->
+  error;
+check_passwd([], _Passwd) ->
+  error;
+check_passwd(_Hash1, _Hash2) ->
+  error.
 

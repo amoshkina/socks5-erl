@@ -9,7 +9,7 @@
 -author("anna").
 
 -define(SOCKS_VER, 5).
--define(AUTH_METHODS, [?NO_AUTH]).
+-define(AUTH_METHODS, [?NO_AUTH, ?UNAME_PASSWD]).
 
 %% Server's replies after evaluating request
 -define(SUCCESS, 0).
@@ -40,3 +40,7 @@
 -define(GSSAPI, 1).
 -define(UNAME_PASSWD, 2).
 -define(NO_ACCEPTABLE_METH, 16#FF).
+
+%% Username/Password
+-define(UNAME_VER, 1).
+-define(FAILURE, 16#FF).
