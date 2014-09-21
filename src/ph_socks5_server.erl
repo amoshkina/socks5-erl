@@ -199,20 +199,24 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+choose_auth_method(Methods) ->
+  Result = lists:member(?UNAME_PASSWD, Methods),
+  if
+    Result -> {method, ?UNAME_PASSWD, uname_auth};
+    true -> choose_auth_method1(Methods)
+  end.
 
-choose_auth_method([]) ->
+choose_auth_method1([]) ->
   {method, ?NO_ACCEPTABLE_METH};
-choose_auth_method([_Method1, Method2 | Tail]) ->
-  choose_auth_method(Method2, Tail);
-choose_auth_method([Method|Tail]) ->
-  choose_auth_method(Method, Tail).
+choose_auth_method1([Method|Tail]) ->
+  choose_auth_method1(Method, Tail).
 
-choose_auth_method(?NO_AUTH, _Methods) ->
+choose_auth_method1(?NO_AUTH, _Methods) ->
   {method, ?NO_AUTH, socks_req};
-choose_auth_method(?UNAME_PASSWD, _Methods) ->
+choose_auth_method1(?UNAME_PASSWD, _Methods) ->
   {method, ?UNAME_PASSWD, uname_auth};
-choose_auth_method(_Method, Methods) ->
-  choose_auth_method(Methods).
+choose_auth_method1(_Method, Methods) ->
+  choose_auth_method1(Methods).
 
 parse_addr(1, <<HostBin:4/binary, PortBin:2/binary>>) -> % IPv4
   Host = list_to_tuple(binary_to_list(HostBin)),
